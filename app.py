@@ -1712,7 +1712,6 @@
 
 
 
-
 import streamlit as st
 import requests
 import os
@@ -1723,6 +1722,7 @@ import time
 import threading
 import queue
 from datetime import datetime
+import base64
 
 # ========== CONFIGURATION ==========
 # Directory to save extracted files
@@ -1740,6 +1740,10 @@ except Exception as e:
 # Gemini API Key - Default key used for all requests
 GEMINI_API_KEY = "AIzaSyBBFKiwVjOlz06hGtjXe_NBa8D4Iyh_k_k"
 
+# GitHub API Token - Add your token here to increase rate limits
+# With a token, rate limit increases from 60 to 5,000 requests per hour
+GITHUB_TOKEN = st.secrets["github_token"] if "github_token" in st.secrets else ""
+
 # Initialize session state
 if 'repo_contents' not in st.session_state:
     st.session_state.repo_contents = {}
@@ -1750,6 +1754,89 @@ st.set_page_config(
     page_icon="🔍",
     layout="wide"
 )
+
+# ========== GITHUB API HELPER FUNCTIONS ==========
+def check_rate_limit():
+    """Check GitHub API rate limit status and return remaining requests."""
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+    try:
+        response = requests.get("https://api.github.com/rate_limit", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            core_rate = data.get("resources", {}).get("core", {})
+            remaining = core_rate.get("remaining", 0)
+            reset_time = core_rate.get("reset", 0)
+            reset_datetime = datetime.fromtimestamp(reset_time)
+            
+            return {
+                "remaining": remaining,
+                "reset_time": reset_time,
+                "reset_datetime": reset_datetime,
+                "limit": core_rate.get("limit", 60)
+            }
+    except Exception as e:
+        print(f"Error checking rate limit: {str(e)}")
+    
+    # Default values if request fails
+    return {
+        "remaining": 0, 
+        "reset_time": int(time.time()) + 3600,
+        "reset_datetime": datetime.fromtimestamp(int(time.time()) + 3600),
+        "limit": 60
+    }
+
+def fetch_with_rate_limit(url, headers=None, timeout=10, max_retries=3):
+    """
+    Fetch from GitHub API with rate limit awareness and retry logic.
+    Returns (response, error_message)
+    """
+    if headers is None:
+        headers = {}
+    
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            
+            # Check for rate limit
+            if response.status_code == 403:
+                remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+                if remaining == 0:
+                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                    reset_datetime = datetime.fromtimestamp(reset_time)
+                    wait_time = max(reset_time - time.time(), 0)
+                    
+                    # If this isn't the last attempt and wait time is reasonable, wait and retry
+                    if attempt < max_retries - 1 and wait_time < 300:  # Wait up to 5 minutes
+                        time.sleep(wait_time + 1)  # Add 1 second buffer
+                        continue
+                    
+                    return None, f"GitHub API rate limit exceeded. Reset at {reset_datetime.strftime('%Y-%m-%d %H:%M:%S')}. "
+            
+            # For other non-200 responses, return error
+            if response.status_code != 200:
+                if attempt < max_retries - 1:
+                    # Exponential backoff
+                    time.sleep((2 ** attempt) + 1)
+                    continue
+                return None, f"GitHub API returned status code {response.status_code}: {response.text}"
+            
+            # Success!
+            return response, None
+            
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                time.sleep((2 ** attempt) + 1)
+                continue
+            return None, f"Request error: {str(e)}"
+    
+    return None, "Maximum retries exceeded"
 
 # ========== FUNCTION TO PARSE GITHUB REPO URL ==========
 def parse_github_url(repo_url):
@@ -1771,6 +1858,13 @@ def fetch_github_repo_text(repo_owner, repo_name, uuid):
     # Ensure session state is initialized
     if 'repo_contents' not in st.session_state:
         st.session_state.repo_contents = {}
+    
+    # Check rate limit before starting
+    rate_limit = check_rate_limit()
+    if rate_limit["remaining"] <= 5:  # Keep a small buffer
+        reset_time = rate_limit["reset_datetime"]
+        wait_time = max(rate_limit["reset_time"] - time.time(), 0)
+        return None, f"GitHub API rate limit nearly exhausted ({rate_limit['remaining']} remaining). Rate limit will reset at {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (in approximately {wait_time/60:.1f} minutes)."
         
     # Try main branch first, then master if main fails
     branches = ["main", "master"]
@@ -1779,15 +1873,15 @@ def fetch_github_repo_text(repo_owner, repo_name, uuid):
     
     for branch in branches:
         api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees/{branch}?recursive=1"
-        response = requests.get(api_url)
+        response, error = fetch_with_rate_limit(api_url)
         
-        if response.status_code == 200:
+        if response and not error:
             data = response.json()
             branch_used = branch
             break
     
     if not data:
-        return None, "Failed to fetch repository structure. Repository might be private or doesn't exist."
+        return None, f"Failed to fetch repository structure. Repository might be private or doesn't exist. {error if error else ''}"
     
     extracted_text = f"# Repository: {repo_owner}/{repo_name}\n"
     extracted_text += f"# Date Extracted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -1801,6 +1895,10 @@ def fetch_github_repo_text(repo_owner, repo_name, uuid):
     file_count = 0
     total_size = 0
     files_processed = []
+    
+    # Track API requests to avoid rate limiting
+    api_requests = 0
+    max_api_requests = min(60, rate_limit["remaining"] - 5)  # Leave some buffer
 
     for item in data.get("tree", []):
         file_path = item["path"]
@@ -1815,12 +1913,44 @@ def fetch_github_repo_text(repo_owner, repo_name, uuid):
             continue
 
         if item["type"] == "blob":  # Process only files
-            raw_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{branch_used}/{file_path}"
-            
-            # Fetch file content
+            # Check if we're approaching API limits
+            api_requests += 1
+            if api_requests >= max_api_requests:
+                extracted_text += f"\n\nWARNING: Stopped processing after {file_count} files to avoid hitting API rate limits.\n"
+                break
+                
+            # First try to get content using the Git Data API (more efficient for larger repos)
             try:
-                raw_response = requests.get(raw_url, timeout=10)
-                if raw_response.status_code == 200:
+                # For smaller files, use the blob content directly
+                if item.get("size", 0) < 1000000:  # Files under ~1MB
+                    if "url" in item:
+                        blob_url = item["url"]
+                        blob_response, error = fetch_with_rate_limit(blob_url)
+                        
+                        if blob_response and not error:
+                            blob_data = blob_response.json()
+                            if blob_data.get("encoding") == "base64" and "content" in blob_data:
+                                content = base64.b64decode(blob_data["content"]).decode('utf-8', errors='replace')
+                                file_count += 1
+                                total_size += len(content)
+                                files_processed.append(file_path)
+                                
+                                # Add file header with path
+                                extracted_text += f"\n\n{'=' * 80}\n"
+                                extracted_text += f"FILE: {file_path}\n"
+                                extracted_text += f"{'=' * 80}\n\n"
+                                extracted_text += content
+                                extracted_text += f"\n\n{'-' * 80}\n"
+                                continue
+            except Exception as e:
+                # Fall back to raw URL if blob API fails
+                pass
+                
+            # Fallback: use raw URL 
+            raw_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{branch_used}/{file_path}"
+            try:
+                raw_response, error = fetch_with_rate_limit(raw_url)
+                if raw_response and not error:
                     content = raw_response.text
                     file_count += 1
                     total_size += len(content)
@@ -1832,6 +1962,8 @@ def fetch_github_repo_text(repo_owner, repo_name, uuid):
                     extracted_text += f"{'=' * 80}\n\n"
                     extracted_text += content
                     extracted_text += f"\n\n{'-' * 80}\n"
+                else:
+                    extracted_text += f"\n\nFailed to fetch: {file_path} - Error: {error if error else 'Unknown error'}\n\n"
             except Exception as e:
                 extracted_text += f"\n\nFailed to fetch: {file_path} - Error: {str(e)}\n\n"
 
@@ -1949,33 +2081,49 @@ def analyze_with_gemini(repo_text, assignment_text):
 
     headers = {"Content-Type": "application/json"}
 
-    # Make request to Gemini API
-    try:
-        response = requests.post(gemini_api_url, headers=headers, json=payload, timeout=60)
-        
-        if response.status_code == 200:
-            json_response = response.json()
-            if "candidates" in json_response and json_response["candidates"]:
-                # Extract the raw text response
-                raw_response = json_response["candidates"][0]["content"]["parts"][0]["text"]
-                
-                # Clean up the response to extract just the JSON
-                # Remove markdown code blocks if present
-                clean_response = raw_response.replace("```json", "").replace("```", "").strip()
-                
-                # Try to parse as JSON to validate
-                try:
-                    parsed_json = json.loads(clean_response)
-                    # Return the properly formatted JSON string
-                    return json.dumps(parsed_json, indent=2), parsed_json
-                except json.JSONDecodeError:
-                    return f"Error: Invalid JSON response from Gemini API: {clean_response}", None
+    # Make request to Gemini API with retries
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(gemini_api_url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code == 200:
+                json_response = response.json()
+                if "candidates" in json_response and json_response["candidates"]:
+                    # Extract the raw text response
+                    raw_response = json_response["candidates"][0]["content"]["parts"][0]["text"]
+                    
+                    # Clean up the response to extract just the JSON
+                    # Remove markdown code blocks if present
+                    clean_response = raw_response.replace("```json", "").replace("```", "").strip()
+                    
+                    # Try to parse as JSON to validate
+                    try:
+                        parsed_json = json.loads(clean_response)
+                        # Return the properly formatted JSON string
+                        return json.dumps(parsed_json, indent=2), parsed_json
+                    except json.JSONDecodeError:
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                        return f"Error: Invalid JSON response from Gemini API: {clean_response}", None
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    return "Error: No meaningful response from Gemini API", None
             else:
-                return "Error: No meaningful response from Gemini API", None
-        else:
-            return f"Error calling Gemini API: {response.status_code} - {response.text}", None
-    except Exception as e:
-        return f"Error during API call: {str(e)}", None
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                return f"Error calling Gemini API: {response.status_code} - {response.text}", None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            return f"Error during API call: {str(e)}", None
+    
+    return "All Gemini API attempts failed", None
 
 
 # ========== PROCESS SINGLE REPOSITORY ==========
@@ -1994,8 +2142,19 @@ def process_single_repository(repo_url, uuid, assignment_text, status_placeholde
     if not repo_owner or not repo_name:
         status_placeholder.error(f"Invalid GitHub repository URL: {repo_url}")
         return False
+    
+    # 2. Check GitHub API rate limits first
+    rate_limit = check_rate_limit()
+    if rate_limit["remaining"] <= 2:  # Critical threshold
+        wait_time = max(rate_limit["reset_time"] - time.time(), 0)
+        status_placeholder.error(
+            f"GitHub API rate limit exceeded ({rate_limit['remaining']} of {rate_limit['limit']} " 
+            f"requests remaining). Limit will reset at {rate_limit['reset_datetime'].strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(in approximately {wait_time/60:.1f} minutes)."
+        )
+        return False
         
-    # 2. Extract repository
+    # 3. Extract repository
     status_placeholder.info(f"Extracting content from {repo_owner}/{repo_name}...")
     file_path, message = fetch_github_repo_text(repo_owner, repo_name, uuid)
     
@@ -2005,7 +2164,7 @@ def process_single_repository(repo_url, uuid, assignment_text, status_placeholde
         
     status_placeholder.success(f"Repository extracted: {repo_owner}/{repo_name}")
     
-    # 3. Analyze
+    # 4. Analyze
     status_placeholder.info(f"Analyzing {repo_owner}/{repo_name} against assignment requirements...")
     
     # Try to read from file first, then fallback to session state
@@ -2037,92 +2196,114 @@ def process_single_repository(repo_url, uuid, assignment_text, status_placeholde
 def process_repo_worker(task_queue, result_queue, assignment_text):
     """Worker thread to process repository tasks."""
     while True:
-        task = task_queue.get()
-        if task is None:  # Poison pill to signal thread termination
-            break
-            
-        repo_url, uuid = task
-        repo_owner, repo_name = parse_github_url(repo_url)
-        
-        # Skip invalid URLs
-        if not repo_owner or not repo_name:
-            result_queue.put({
-                "repo_url": repo_url,
-                "uuid": uuid,
-                "status": "error",
-                "message": "Invalid GitHub repository URL",
-                "match_percentage": None,
-                "analysis": None
-            })
-            task_queue.task_done()
-            continue
-            
-        # Extract repository
         try:
-            file_path, message = fetch_github_repo_text(repo_owner, repo_name, uuid)
+            task = task_queue.get(timeout=30)  # Add timeout to prevent blocking forever
+            if task is None:  # Poison pill to signal thread termination
+                task_queue.task_done()
+                break
+                
+            repo_url, uuid = task
+            repo_owner, repo_name = parse_github_url(repo_url)
             
-            if not file_path:
+            # Skip invalid URLs
+            if not repo_owner or not repo_name:
                 result_queue.put({
                     "repo_url": repo_url,
                     "uuid": uuid,
                     "status": "error",
-                    "message": message,
+                    "message": "Invalid GitHub repository URL",
+                    "match_percentage": None,
+                    "analysis": None
+                })
+                task_queue.task_done()
+                continue
+
+            # Check rate limits before each repository
+            rate_limit = check_rate_limit()
+            if rate_limit["remaining"] <= 2:  # Critical threshold
+                wait_time = max(rate_limit["reset_time"] - time.time(), 0)
+                result_queue.put({
+                    "repo_url": repo_url,
+                    "uuid": uuid,
+                    "status": "error",
+                    "message": f"GitHub API rate limit reached. Reset at {rate_limit['reset_datetime'].strftime('%Y-%m-%d %H:%M:%S')} (in {wait_time/60:.1f} min)",
                     "match_percentage": None,
                     "analysis": None
                 })
                 task_queue.task_done()
                 continue
                 
-            # Try to read from file first, then fallback to session state
-            extracted_text = ""
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    extracted_text = f.read()
-            elif 'repo_contents' in st.session_state and uuid in st.session_state.repo_contents:
-                extracted_text = st.session_state.repo_contents[uuid]
-            else:
-                result_queue.put({
-                    "repo_url": repo_url,
-                    "uuid": uuid,
-                    "status": "error",
-                    "message": "Repository content not found",
-                    "match_percentage": None,
-                    "analysis": None
-                })
-                task_queue.task_done()
-                continue
+            # Extract repository
+            try:
+                file_path, message = fetch_github_repo_text(repo_owner, repo_name, uuid)
                 
-            analysis_text, analysis_json = analyze_with_gemini(extracted_text, assignment_text)
-            
-            if analysis_json:
-                result_queue.put({
-                    "repo_url": repo_url,
-                    "uuid": uuid,
-                    "status": "success",
-                    "message": "Analysis complete",
-                    "match_percentage": analysis_json.get("match_percentage", "N/A"),
-                    "analysis": analysis_json
-                })
-            else:
+                if not file_path:
+                    result_queue.put({
+                        "repo_url": repo_url,
+                        "uuid": uuid,
+                        "status": "error",
+                        "message": message,
+                        "match_percentage": None,
+                        "analysis": None
+                    })
+                    task_queue.task_done()
+                    continue
+                    
+                # Try to read from file first, then fallback to session state
+                extracted_text = ""
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        extracted_text = f.read()
+                elif 'repo_contents' in st.session_state and uuid in st.session_state.repo_contents:
+                    extracted_text = st.session_state.repo_contents[uuid]
+                else:
+                    result_queue.put({
+                        "repo_url": repo_url,
+                        "uuid": uuid,
+                        "status": "error",
+                        "message": "Repository content not found",
+                        "match_percentage": None,
+                        "analysis": None
+                    })
+                    task_queue.task_done()
+                    continue
+                    
+                analysis_text, analysis_json = analyze_with_gemini(extracted_text, assignment_text)
+                
+                if analysis_json:
+                    result_queue.put({
+                        "repo_url": repo_url,
+                        "uuid": uuid,
+                        "status": "success",
+                        "message": "Analysis complete",
+                        "match_percentage": analysis_json.get("match_percentage", "N/A"),
+                        "analysis": analysis_json
+                    })
+                else:
+                    result_queue.put({
+                        "repo_url": repo_url,
+                        "uuid": uuid,
+                        "status": "error",
+                        "message": f"Analysis failed: {analysis_text}",
+                        "match_percentage": None,
+                        "analysis": None
+                    })
+            except Exception as e:
                 result_queue.put({
                     "repo_url": repo_url,
                     "uuid": uuid,
                     "status": "error",
-                    "message": f"Analysis failed: {analysis_text}",
+                    "message": f"Processing failed: {str(e)}",
                     "match_percentage": None,
                     "analysis": None
                 })
+            finally:
+                task_queue.task_done()
+        except queue.Empty:
+            # Timeout occurred, exit the loop
+            break
         except Exception as e:
-            result_queue.put({
-                "repo_url": repo_url,
-                "uuid": uuid,
-                "status": "error",
-                "message": f"Processing failed: {str(e)}",
-                "match_percentage": None,
-                "analysis": None
-            })
-        finally:
-            task_queue.task_done()
+            print(f"Worker thread error: {str(e)}")
 
 
 # ========== BATCH PROCESS MULTIPLE REPOSITORIES ==========
@@ -2139,12 +2320,33 @@ def process_batch_repositories(repo_data, assignment_text, progress_bar, status_
     num_repositories = len(repo_data)
     status_placeholder.info(f"Processing {num_repositories} repositories...")
     
+    # Check GitHub API rate limits before starting batch processing
+    rate_limit = check_rate_limit()
+    
+    # Show rate limit information
+    rate_info = f"GitHub API: {rate_limit['remaining']} of {rate_limit['limit']} requests remaining. "
+    if rate_limit["remaining"] < num_repositories * 2:  # Estimate ~2 requests per repo
+        rate_info += f"⚠️ This may not be enough for all repositories. "
+        
+    rate_info += f"Rate limit resets at {rate_limit['reset_datetime'].strftime('%Y-%m-%d %H:%M:%S')}"
+    status_placeholder.warning(rate_info)
+    
+    if rate_limit["remaining"] <= 2:  # Critical threshold
+        wait_time = max(rate_limit["reset_time"] - time.time(), 0)
+        status_placeholder.error(
+            f"GitHub API rate limit too low to process repositories. " 
+            f"Please wait until {rate_limit['reset_datetime'].strftime('%H:%M:%S')} " 
+            f"(approximately {wait_time/60:.1f} minutes) and try again."
+        )
+        return None
+    
     # Create queues
     task_queue = queue.Queue()
     result_queue = queue.Queue()
     
-    # Number of worker threads (adjust based on needs)
-    num_workers = min(4, num_repositories)  # Maximum 4 workers to avoid API rate limits
+    # Number of worker threads (adjust based on rate limits)
+    max_workers = min(rate_limit["remaining"] // 10, 5)  # At most 5 workers, but fewer if rate limits are low
+    num_workers = max(1, min(max_workers, num_repositories))  # At least 1, at most max_workers or num_repositories
     
     # Create and start worker threads
     threads = []
@@ -2173,12 +2375,15 @@ def process_batch_repositories(repo_data, assignment_text, progress_bar, status_
     completed = 0
     results = []
     
-    # Monitor the result queue until all tasks are done
-    while completed < num_repositories:
+    # Monitor the result queue until all tasks are done or timeout occurs
+    max_wait_time = 60 * num_repositories  # Maximum wait time in seconds 
+    start_time = time.time()
+    while completed < num_repositories and (time.time() - start_time) < max_wait_time:
         try:
-            result = result_queue.get(timeout=0.5)
+            result = result_queue.get(timeout=5)
             results.append(result)
             completed += 1
+            result_queue.task_done()
             
             # Update progress bar
             progress_bar.progress(completed / num_repositories)
@@ -2196,15 +2401,24 @@ def process_batch_repositories(repo_data, assignment_text, progress_bar, status_
             results_table.dataframe(results_df)
             
         except queue.Empty:
-            # No results available yet
+            # No results available yet, check if threads are still running
+            if all(not thread.is_alive() for thread in threads):
+                status_placeholder.warning("All worker threads have exited but not all repositories were processed.")
+                break
             continue
     
-    # Wait for threads to finish
+    # Wait for threads to finish (with timeout)
     for thread in threads:
-        thread.join()
-        
-    progress_bar.progress(1.0)
-    status_placeholder.success(f"Completed processing {num_repositories} repositories")
+        thread.join(timeout=5)
+    
+    # If we processed all repositories, set progress to 100%
+    if completed == num_repositories:
+        progress_bar.progress(1.0)
+        status_placeholder.success(f"Completed processing {completed} of {num_repositories} repositories")
+    else:
+        # Some repositories were not processed
+        progress_bar.progress(completed / num_repositories)
+        status_placeholder.warning(f"Processed {completed} of {num_repositories} repositories. Some repositories may have failed or timed out.")
     
     # Return final results for further processing
     return results
